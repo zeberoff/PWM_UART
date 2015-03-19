@@ -1,0 +1,212 @@
+/*This program does 4 things: 
+1) An output pin is linked to a hardware timed PWM cycle, which controls the brightness of LED's.
+2) The brightness of the LED's changes according to the duty cycle, which is linked to a master clock.
+3) Referencing each count from the master clock, a new duty cycle value is fetched from a predefined array. 
+4) Any 4 digit number received from the UART can overide and reprogram the master clock, which effectively adjusts the LED brightness. 
+*/
+
+#include "msp430g2553.h"
+#include "Data.h"
+#include <string.h>
+
+
+#define END_BYTE 'X'
+#define MAX_BUF_LEN 256
+#define RXD BIT1
+#define TXD BIT2
+#define LED1 BIT0
+#define LED2 BIT6
+#define RX_BUF UCA0RXBUF
+#define TX_BUF UCA0TXBUF
+
+
+
+unsigned char current_time_array_index; //Counter
+volatile int true_time = 0;
+volatile char value1 = 0;
+volatile char value2 = 0;
+volatile char value3 = 0;
+volatile char value4 = 0;
+
+static int frequency = 128; //This is the frequency of the light
+static int PWM_Period = 256; //32768/frequency
+static int modulation_step_period = 64; /*Note the value "32" represents 0.5 seconds for each modulation event.  Since the array has 1440 duty cycle values, it takes 720 seconds for the program to cycle through the array. Therefore the LED intensity cycle takes 720 seconds. */
+
+unsigned char Current_Time[MAX_BUF_LEN - 1];
+char process_flag = 0;
+int uart_packet_length = 0;
+char frame_received_flag = 0;
+unsigned int count = 0;
+
+
+
+void InitializePWM(void)
+{
+	P1DIR |= BIT6;  // P1.6 output
+	P1SEL |= BIT6;  // P1.6 TA0/1 tethered with output pin
+
+	TACCR0 = PWM_Period;  // Timer counts to this value, which initiates ISR
+
+	TACCTL0 |= CCIE;  // enable CCIFG interrupt
+	TACCTL1 = OUTMOD_7;  // TA0CCR1 reset/set
+	TACCR1 = 0;  // TA0CCR1 PWM initial duty cycle
+	TACTL = TASSEL_1 | MC_1;  // ACLK source, count in up mode
+	TACCR0 &= ~CCIFG;  // clear interrupt flag
+}
+
+void InitializeUART(void)
+{
+	P1SEL |= RXD + TXD;  // P1.1 = RXD, P1.2 = TXD
+	P1SEL2 |= RXD + TXD;  // P1.1 = RXD, P1.2 = TXD
+
+	UCA0CTL1 |= UCSSEL_2;  // Use system Master Clock at 1MHz
+	UCA0BR0 = 104;  // (1 MHz)/(9600 bps)
+	UCA0BR1 = 0;
+	UCA0MCTL = UCBRS0;  // modulation UCBRSx = 1 found on pg 424 of datasheet
+	UCA0CTL1 &= ~UCSWRST;  // ** initialize USCI state machine **
+	IE2 |= UCA0RXIE;  // Enable USCI_A0 RX interrupt
+}
+
+void main(void)
+{
+	WDTCTL = WDTPW + WDTHOLD; // Disable WDT
+
+	BCSCTL3 |= LFXT1S_0 + XCAP_3;  //Operate Master clock on external crystal (32KHz). XCAP_3 is for 12.5pF capacitor
+	BCSCTL1  = CALBC1_1MHZ;  // calibration for basic clock system
+	DCOCTL 	 = CALDCO_1MHZ;  // calibration for digitally controlled oscillator
+
+	InitializePWM();
+	InitializeUART();
+
+	P1DIR |= LED1 + LED2;
+	P1OUT &= 0x00;
+
+	__bis_SR_register(LPM0_bits + GIE);  // go to sleep in low-power mode 0, all interrupts enabled
+ }
+
+// Every time TA0 reaches PWM_Period ISR enabled
+ #pragma vector=TIMER0_A0_VECTOR
+    __interrupt void Timer0_A0 (void)
+{
+	static int modulation_event_counter = 0;
+	static int intensity_index_counter = 0;
+
+	if (modulation_event_counter == modulation_step_period)
+     	{
+    		if (frame_received_flag == 1) // If user sends a new "time of day" via UART, this overrides the the current clock time.
+    		{
+    		 	intensity_index_counter = true_time;
+    		 	intensity_index_counter++;  // index value that is used to callout the corresponding value in the array.
+    		 	TACCR1 = intensity_profile[intensity_index_counter];
+    		 	frame_received_flag = 0;
+    	 	}
+    	 	else // otherwise continue modulating with current clock time.
+         	{
+    			intensity_index_counter++;
+    			TACCR1 = intensity_profile[intensity_index_counter];
+    		 }
+
+    	 if (intensity_index_counter == 1440) // resets
+    	 {
+    	 	intensity_index_counter = 0;
+    	        TACCR1 = 0;
+    	 }
+
+    	 	modulation_event_counter = 0;
+     	 }
+
+	else
+	{
+         	modulation_event_counter++;
+	}
+}
+
+//UART RX USCI Interrupt. This triggers when the USCI receives a char.
+#pragma vector = USCIAB0RX_VECTOR
+__interrupt void USCI0RX_ISR(void)
+
+{
+	if(current_time_array_index == MAX_BUF_LEN-1) //protect from buffer overflow
+	{
+		current_time_array_index = 0;
+	}
+
+
+	// Received Starting Byte
+	if(!process_flag && (RX_BUF == 'A'))
+	{
+		P1OUT |= LED1;
+		process_flag = 1;
+		current_time_array_index = 0; //Assigning this to 0 assures that each time a new time is received, the counter starts from at the beginning of the array.
+	}
+
+	else if(process_flag && (RX_BUF != END_BYTE))
+	{
+		Current_Time[current_time_array_index] = RX_BUF; //passing received characters one-by-one into an array
+		//TX_BUF = Current_Time[current_time_array_index];
+		current_time_array_index++;
+
+		//These statements convert char to int depending on the size of the received char
+		value1 = Current_Time[0];
+		value2 = Current_Time[1];
+		value3 = Current_Time[2];
+		value4 = Current_Time[3];
+
+		if (current_time_array_index == 1)
+		{
+			true_time = (value1 - '0');
+		}
+		if (current_time_array_index == 2)
+		{
+			true_time = (value1 - '0')*10 + (value2 - '0');
+		}
+		if (current_time_array_index == 3)
+		{
+			true_time = (value1 - '0')*100 + (value2 - '0')*10 + (value3 - '0');
+		}
+		if (current_time_array_index == 4)
+		{
+			true_time = (value1 - '0')*1000 + (value2 - '0')*100 + (value3 - '0')*10 + (value4 - '0');
+		}
+	}
+
+	// Received Stop Byte and reset
+	else if(process_flag && (RX_BUF == END_BYTE))
+	{
+		TX_BUF = 'A';
+		P1OUT &= ~LED1;
+		frame_received_flag = 1;
+		uart_packet_length = current_time_array_index-2; // Discard START and END bytes
+		process_flag = 0;
+
+		//Resets
+		Current_Time[0] = 0;
+		Current_Time[1] = 0;
+		Current_Time[2] = 0;
+		Current_Time[3] = 0;
+		value1 = 0;
+		value2 = 0;
+		value3 = 0;
+		value4 = 0;
+	}
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
